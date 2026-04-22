@@ -1,0 +1,140 @@
+version: "3.9"
+
+# COFL: Continuous Operational Feedback Loop
+# Four-service containerized stack on isolated bridge network
+# Reference: Chen et al., MDPI Information 2026
+
+networks:
+  cofl-net:
+    driver: bridge
+
+volumes:
+  ollama_data:
+  n8n_data:
+  postgres_data:
+
+services:
+
+  # ─────────────────────────────────────────────
+  # 1. Ollama — On-premise LLM Inference Engine
+  #    Port: 11434 | Model: LLaMA 3 8B Q4_K_M
+  # ─────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: cofl-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_NUM_PARALLEL=1
+      - OLLAMA_MAX_LOADED_MODELS=1
+      # Context window and generation parameters (paper §3.6)
+      - OLLAMA_CONTEXT_LENGTH=4096
+      - OLLAMA_NUM_PREDICT=256
+    networks:
+      - cofl-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ─────────────────────────────────────────────
+  # 2. FastAPI Gateway — Async Microservice
+  #    Port: 8000 | Workers: 4 async (Uvicorn)
+  # ─────────────────────────────────────────────
+  fastapi:
+    build:
+      context: ./fastapi
+      dockerfile: Dockerfile
+    container_name: cofl-fastapi
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3:8b-instruct-q4_K_M}
+      - POSTGRES_DSN=postgresql://${POSTGRES_USER:-cofl}:${POSTGRES_PASSWORD:-coflsecret}@postgres:5432/${POSTGRES_DB:-cofldb}
+      - LLM_TEMPERATURE=0.1
+      - SENTIMENT_THRESHOLD=0.35
+      - GENERATE_MAX_WORDS=150
+    depends_on:
+      ollama:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - cofl-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ─────────────────────────────────────────────
+  # 3. n8n — Event-Driven Workflow Engine
+  #    Port: 5678 | Version: 1.32.0
+  # ─────────────────────────────────────────────
+  n8n:
+    image: n8nio/n8n:1.32.0
+    container_name: cofl-n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_HOST=${N8N_HOST:-localhost}
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - NODE_ENV=production
+      - WEBHOOK_URL=http://${N8N_HOST:-localhost}:5678/
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER:-admin}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD:-cofl2026}
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=${POSTGRES_DB:-cofldb}
+      - DB_POSTGRESDB_USER=${POSTGRES_USER:-cofl}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD:-coflsecret}
+      - N8N_LOG_LEVEL=info
+      - EXECUTIONS_PROCESS=main
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./n8n/workflows:/home/node/.n8n/workflows:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - cofl-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5678/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ─────────────────────────────────────────────
+  # 4. PostgreSQL — Event Log & Metrics Store
+  #    Port: 5432 | Version: 15-alpine
+  # ─────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: cofl-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-cofldb}
+      - POSTGRES_USER=${POSTGRES_USER:-cofl}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-coflsecret}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - cofl-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cofl} -d ${POSTGRES_DB:-cofldb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
